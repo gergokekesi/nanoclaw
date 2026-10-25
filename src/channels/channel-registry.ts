@@ -267,14 +267,16 @@ export function getChannelContainerConfig(name: string): ChannelRegistration['co
 export async function initChannelAdapters(setupFn: (adapter: ChannelAdapter) => ChannelSetup): Promise<void> {
   hotStartSetupFn = setupFn;
   for (const [name, registration] of registry) {
+    let adapter: ChannelAdapter | null = null;
+    let setup: ChannelSetup | null = null;
     try {
-      const adapter = await registration.factory();
+      adapter = await registration.factory();
       if (!adapter) {
         log.warn('Channel credentials missing, skipping', { channel: name });
         continue;
       }
 
-      const setup = setupFn(adapter);
+      setup = setupFn(adapter);
       // Transient network failures during adapter init (e.g. Telegram deleteWebhook
       // hitting a DNS hiccup at boot) would otherwise leave the channel permanently
       // dead until manual restart. Retry only on NetworkError so misconfigs (bad
@@ -300,24 +302,73 @@ export async function initChannelAdapters(setupFn: (adapter: ChannelAdapter) => 
           throw err;
         }
       }
-      // Adapters key by instance (default instance = channelType), so N
-      // instances of one platform coexist. Duplicate keys warn instead of
-      // throwing — boot stays resilient, matching the historical silent
-      // last-write-wins, but now visibly.
-      const key = adapter.instance ?? adapter.channelType;
-      if (activeAdapters.has(key)) {
-        log.warn('Duplicate adapter instance key — overwriting previous adapter', { key, channel: name });
-      }
-      activeAdapters.set(key, adapter);
-      log.info('Channel adapter started', { channel: name, type: adapter.channelType, instance: key });
+      activateAdapter(name, adapter, 'Channel adapter started');
     } catch (err) {
+      if (adapter && setup && isNetworkError(err)) {
+        log.warn('Channel adapter offline after startup retries, retrying every minute in the background', {
+          channel: name,
+          err: err.message,
+        });
+        scheduleRecovery(name, adapter, setup, 0);
+        continue;
+      }
       log.error('Failed to start channel adapter', { channel: name, err });
     }
   }
 }
 
+// Adapters key by instance (default instance = channelType), so N
+// instances of one platform coexist. Duplicate keys warn instead of
+// throwing — boot stays resilient, matching the historical silent
+// last-write-wins, but now visibly.
+function activateAdapter(name: string, adapter: ChannelAdapter, message: string, extra?: Record<string, unknown>): void {
+  const key = adapter.instance ?? adapter.channelType;
+  if (activeAdapters.has(key)) {
+    log.warn('Duplicate adapter instance key — overwriting previous adapter', { key, channel: name });
+  }
+  activeAdapters.set(key, adapter);
+  log.info(message, { channel: name, type: adapter.channelType, instance: key, ...extra });
+}
+
+/** Wi-Fi being down across a reboot outlasts the boot retries, so the channel
+ *  keeps retrying in the background instead of staying dead until a restart. */
+const RECOVERY_INTERVAL_MS = 60_000;
+const RECOVERY_LOG_EVERY_ATTEMPTS = 30;
+const recoveryTimers = new Map<string, NodeJS.Timeout>();
+
+function scheduleRecovery(name: string, adapter: ChannelAdapter, setup: ChannelSetup, attempts: number): void {
+  const timer = setTimeout(async () => {
+    const attempt = attempts + 1;
+    try {
+      await adapter.setup(setup);
+    } catch (err) {
+      if (recoveryTimers.get(name) !== timer) return;
+      if (!isNetworkError(err)) {
+        recoveryTimers.delete(name);
+        log.error('Failed to start channel adapter', { channel: name, attempts: attempt, err });
+        return;
+      }
+      if (attempt % RECOVERY_LOG_EVERY_ATTEMPTS === 0) {
+        log.warn('Channel adapter still offline, retrying', { channel: name, attempts: attempt, err: err.message });
+      }
+      scheduleRecovery(name, adapter, setup, attempt);
+      return;
+    }
+    if (recoveryTimers.get(name) !== timer) {
+      await adapter.teardown().catch(() => {});
+      return;
+    }
+    recoveryTimers.delete(name);
+    activateAdapter(name, adapter, 'Channel adapter recovered', { attempts: attempt });
+  }, RECOVERY_INTERVAL_MS);
+  timer.unref();
+  recoveryTimers.set(name, timer);
+}
+
 /** Tear down all active adapters. */
 export async function teardownChannelAdapters(): Promise<void> {
+  for (const timer of recoveryTimers.values()) clearTimeout(timer);
+  recoveryTimers.clear();
   for (const [name, adapter] of activeAdapters) {
     try {
       await adapter.teardown();
